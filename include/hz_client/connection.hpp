@@ -9,6 +9,7 @@
 #include <boost/asio/read.hpp>
 #include <boost/asio/write.hpp>
 #include <boost/asio/compose.hpp>
+#include <boost/asio/buffers_iterator.hpp>
 #include <boost/uuid/uuid.hpp>
 #include <boost/uuid/random_generator.hpp>
 
@@ -50,6 +51,11 @@ public:
         return m_write_buffer;
     }
 
+    int generate_id()
+    {
+        return ++m_correlation_id;
+    }
+
     void start_reader()
     {
         boost::asio::async_read(
@@ -66,105 +72,62 @@ public:
 
 private:
 
-    // void on_connected(const error_code& err)
-    // {
-    //     if (err)
-    //     {
-    //         std::cerr << "Error occurred." << std::endl;
-
-    //         return;
-    //     }
-
-    //     boost::asio::async_write(
-    //         m_sck,
-    //         boost::asio::buffer("CP2", 3),
-    //         bind(
-    //             &connection::on_protocol_sent ,
-    //             shared_from_this() ,
-    //             std::placeholders::_1
-    //         )
-    //     );
-    //     boost::asio::async_read(
-    //         m_sck,
-    //         m_read_buffer,
-    //         boost::asio::transfer_exactly(message::frame_header::HEADER_SIZE),
-    //         bind(
-    //             &connection::on_frame_header_read,
-    //             shared_from_this() ,
-    //             std::placeholders::_1
-    //         )
-    //     );
-    // }
-
-    // void on_protocol_sent(const error_code& err)
-    // {
-    //     std::cout << "protocol_sent" << std::endl;
-
-    //     message::request<message::authentication> auth_req;
-
-    //     auth_req.cluster_name = "dev";
-    //     auth_req.uid = boost::uuids::uuid(boost::uuids::random_generator()());
-    //     auth_req.instance_name = "hz.client_2";
-    //     auth_req.header.correlation_id = rand();
-
-    //     rbs::serialize_le(auth_req, m_write_buffer);
-
-    //     boost::asio::async_write(
-    //         m_sck,
-    //         m_write_buffer,
-    //         [](const error_code& err, std::size_t n_written){
-
-    //         }
-    //     );
-    // }
-
     void on_frame_header_read(const error_code& err)
     {
-        std::cout << "frame_header__read" << std::endl;
         message::frame_header header;
         rbs::le_stream ss {m_read_buffer};
 
         ss >> header;
-        ss << header;
 
-        if (header.flags | message::frame_header::IS_FINAL_FLAG)
-            std::cout << "Final flag is seen" << std::endl;
+        bool is_final { bool(header.flags & message::frame_header::IS_FINAL_FLAG) };
 
         if (header.length > message::frame_header::HEADER_SIZE)
         {
+            int needs_to_be_read {header.length - message::frame_header::HEADER_SIZE};
+
             boost::asio::async_read(
                 m_sck,
                 m_read_buffer,
-                boost::asio::transfer_exactly(header.length - 6),
+                boost::asio::transfer_exactly(needs_to_be_read),
                 bind(
-                    &connection::on_frame_read ,
-                    shared_from_this() ,
-                    std::placeholders::_1
+                    &connection::on_frame_read,
+                    shared_from_this(),
+                    std::placeholders::_1,
+                    needs_to_be_read,
+                    is_final
                 )
             );
         }
         else
         {
-            boost::asio::async_read(
-                m_sck,
-                m_read_buffer,
-                boost::asio::transfer_exactly(6),
-                bind(
-                    &connection::on_frame_header_read,
-                    shared_from_this() ,
-                    std::placeholders::_1
-                )
-            );
+            on_frame_read(error_code{}, message::frame_header::HEADER_SIZE, is_final);
         }
     }
 
-    void on_frame_read(const error_code& err)
+    void on_frame_read(const error_code& err, int n_read, bool is_final)
     {
-        std::cout << "frame_read" << std::endl;
+        if (err) {
+            throw std::runtime_error {
+                "Error occurred."
+            };
+        }
+
+        if (is_final)
+            std::cout << "Message received" << std::endl;
+
+        auto buffer = m_read_buffer.data();
+
+        copy(
+            buffers_begin(buffer),
+            buffers_end(buffer),
+            back_inserter(received_message)
+        );
+        m_read_buffer.consume(n_read);
+
         boost::asio::async_read(
             m_sck,
             m_read_buffer,
-            boost::asio::transfer_exactly(6),
+            boost::asio::transfer_exactly(message::frame_header::HEADER_SIZE),
             bind(
                 &connection::on_frame_header_read,
                 shared_from_this() ,
@@ -173,6 +136,8 @@ private:
         );
     }
 
+    std::vector<std::uint8_t> received_message;
+    std::atomic<int> m_correlation_id;
     std::unordered_map<int, std::function<void()>> m_handlers;
     streambuf m_write_buffer;
     streambuf m_read_buffer;
@@ -193,7 +158,7 @@ auto async_connect(
     >
     (
         [
-            conn = &conn,
+            &conn,
             state = started,
             host = std::move(ep)
         ]
@@ -209,7 +174,7 @@ auto async_connect(
                     case started:
                     {
                         state = connecting;
-                        conn->sck().async_connect(
+                        conn.sck().async_connect(
                             host ,
                             std::move(self)
                         );
@@ -219,7 +184,7 @@ auto async_connect(
                     case connecting:
                     {
                         state = start_reader;
-                        conn->start_reader();
+                        conn.start_reader();
 
                         self();
 
@@ -229,7 +194,7 @@ auto async_connect(
                     {
                         state = protocol_sending;
                         boost::asio::async_write(
-                            conn->sck(),
+                            conn.sck(),
                             boost::asio::buffer("CP2", 3),
                             [self = std::move(self)]
                             (const boost::system::error_code& err, std::size_t) mutable
@@ -258,7 +223,7 @@ auto async_authenticate(
 {
     enum {starting, authenticating};
 
-    req.header.correlation_id = rand();
+    req.header.correlation_id = conn.generate_id();
     rbs::serialize_le(req, conn.write_buffer());
 
     return boost::asio::async_compose<
