@@ -35,7 +35,6 @@ inline frame_header begin_frame()
 {
     frame_header x {};
 
-    // x.flags.set(12);
     x.flags = uint16_t(frame_header::BEGIN_DATA_STRUCTURE_FLAG);
 
     return x;

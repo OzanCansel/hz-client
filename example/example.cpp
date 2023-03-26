@@ -1,21 +1,47 @@
+#include <iostream>
+
 #include <boost/asio/io_context.hpp>
-#include <boost/asio/use_future.hpp>
+#include <boost/asio/steady_timer.hpp>
 
 #include <rbs/rbs.hpp>
 
 #include <hz_client/connection.hpp>
+#include <hz_client/message/ping.hpp>
 
-int main()
+static constexpr int MIN_CONCURRENT_INVOCATIONS = 500000;
+std::atomic<int> n_concurrent_invocations = 0;
+std::atomic<int> n_executed = 0;
+
+void benchmark(std::shared_ptr<hz_client::connection> connection)
 {
-    using boost::asio::io_context;
-    using endpoint = boost::asio::ip::tcp::endpoint;
+    while (n_concurrent_invocations < MIN_CONCURRENT_INVOCATIONS)
+    {
+        connection->invoke(
+            hz_client::message::request<hz_client::message::ping>{},
+            [connection, start = std::chrono::steady_clock::now()](const boost::system::error_code& code, std::vector<char>)
+            {
+                n_concurrent_invocations--;
+                n_executed++;
 
-    io_context ctx;
+                using namespace std::chrono;
+
+                auto elapsed = steady_clock::now() - start;
+
+                benchmark(connection);
+            }
+        );
+
+        n_concurrent_invocations++;
+    }
+}
+
+void connect(boost::asio::io_context& ctx)
+{
+    using endpoint = boost::asio::ip::tcp::endpoint;
 
     auto conn = std::make_shared<hz_client::connection>(ctx);
 
-    hz_client::async_connect(
-        *conn,
+    conn->async_connect(
         endpoint
         {
             boost::asio::ip::address_v4::from_string( "127.0.0.1" ) ,
@@ -28,23 +54,63 @@ int main()
             else
                 std::cerr << "Successfully connected." << std::endl;
 
-            hz_client::message::request<hz_client::message::authentication> req;
+            hz_client::message::authentication req;
 
-            req.instance_name = "hz_client1";
+            static std::atomic<int> instance_id = 1;
+
+            req.instance_name = "hz_client" + std::to_string(instance_id);
             req.cluster_name  = "dev";
+            req.uid = boost::uuids::random_generator()();
 
-            hz_client::async_authenticate(
+            conn->async_authenticate(
                 req,
-                *conn,
                 [conn](const boost::system::error_code& err){
                     if (err)
                         std::cout << "Could not authenticated" << std::endl;
                     else
+                    {
+                        benchmark(conn);
                         std::cout << "Successfully authenticated." << std::endl;
+                    }
                 }
             );
         }
     );
+}
 
-    ctx.run();
+void print_speed(
+    const boost::system::error_code& err,
+    boost::asio::steady_timer& timer
+)
+{
+    std::cout << "Ongoing invocations : " << n_concurrent_invocations
+              << " IPS :" << n_executed
+              << std::endl;
+
+    n_executed = 0;
+
+    timer.expires_at(
+        timer.expiry() +
+        std::chrono::seconds {1}
+    );
+
+    timer.async_wait(
+        [&timer](const boost::system::error_code& err){
+            print_speed(err, timer);
+        }
+    );
+}
+
+int main()
+{
+    using boost::asio::io_context;
+
+    io_context ctx;
+
+    boost::asio::steady_timer timer {ctx, std::chrono::seconds{1}};
+
+    print_speed({}, timer);
+    connect(ctx);
+
+    return ctx.run();
 }

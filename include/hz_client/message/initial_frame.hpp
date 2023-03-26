@@ -27,4 +27,17 @@ operator<<(
               << frame.partition_id;
 }
 
+template<auto... Args>
+inline rbs::stream<Args...>&
+operator>>(
+    rbs::stream<Args...>& ss ,
+    initial_frame& frame
+)
+{
+    return ss >> static_cast<frame_header&>(frame)
+              >> frame.type
+              >> frame.correlation_id
+              >> frame.partition_id;
+}
+
 }

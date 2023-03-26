@@ -1,10 +1,10 @@
 #pragma once
 
 #include <memory>
-#include <iostream>
 #include <functional>
 
 #include <boost/asio/io_context.hpp>
+#include <boost/asio/io_context_strand.hpp>
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/read.hpp>
 #include <boost/asio/write.hpp>
@@ -12,11 +12,14 @@
 #include <boost/asio/buffers_iterator.hpp>
 #include <boost/uuid/uuid.hpp>
 #include <boost/uuid/random_generator.hpp>
+#include <boost/iostreams/device/array.hpp>
+#include <boost/iostreams/stream_buffer.hpp>
 
 #include <rbs/rbs.hpp>
 
 #include "hz_client/message/authentication.hpp"
 #include "hz_client/message/request.hpp"
+#include "hz_client/util/make_shallow_copyable.hpp"
 
 namespace hz_client
 {
@@ -26,245 +29,60 @@ class connection :
 {
     using io_context = boost::asio::io_context;
     using socket     = boost::asio::ip::tcp::socket;
+    using strand     = boost::asio::io_context::strand;
     using endpoint   = boost::asio::ip::tcp::endpoint;
     using streambuf  = boost::asio::streambuf;
     using error_code = boost::system::error_code;
 
 public:
 
-    connection(io_context& ctx)
-        :   m_sck {ctx}
-    {}
+    explicit inline connection(io_context& ctx);
 
-    socket& sck()
-    {
-        return m_sck;
-    }
+    inline socket& sck();
 
-    boost::asio::streambuf& read_buffer()
-    {
-        return m_read_buffer;
-    }
+    template<typename CompletionToken>
+    auto async_connect(
+        boost::asio::ip::tcp::endpoint ep,
+        CompletionToken&& token
+    );
 
-    boost::asio::streambuf& write_buffer()
-    {
-        return m_write_buffer;
-    }
+    template<typename CompletionToken>
+    auto async_authenticate(
+        message::authentication req,
+        CompletionToken&& token
+    );
 
-    int generate_id()
-    {
-        return ++m_correlation_id;
-    }
-
-    void start_reader()
-    {
-        boost::asio::async_read(
-            m_sck,
-            m_read_buffer,
-            boost::asio::transfer_exactly(message::frame_header::HEADER_SIZE),
-            bind(
-                &connection::on_frame_header_read,
-                shared_from_this(),
-                std::placeholders::_1
-            )
-        );
-    }
+    template<typename T, typename CompletionToken>
+    auto invoke(
+        message::request<T> message,
+        CompletionToken&& token
+    );
 
 private:
 
-    void on_frame_header_read(const error_code& err)
-    {
-        message::frame_header header;
-        rbs::le_stream ss {m_read_buffer};
+    inline void start_reader();
+    inline void do_write();
+    inline void on_frame_header_read(const error_code& err);
+    inline void on_frame_read(const error_code& err, int n_read, bool is_final);
+    inline void toggle_write_buffer();
+    inline streambuf& writing_buffer();
+    inline streambuf& pending_buffer();
 
-        ss >> header;
+    using byte_array_t    = std::vector<char>;
+    using invocation_cb_t = std::function<void(error_code, byte_array_t)>;
+    using handlers_t      = std::unordered_map<int64_t, invocation_cb_t>;
 
-        bool is_final { bool(header.flags & message::frame_header::IS_FINAL_FLAG) };
-
-        if (header.length > message::frame_header::HEADER_SIZE)
-        {
-            int needs_to_be_read {header.length - message::frame_header::HEADER_SIZE};
-
-            boost::asio::async_read(
-                m_sck,
-                m_read_buffer,
-                boost::asio::transfer_exactly(needs_to_be_read),
-                bind(
-                    &connection::on_frame_read,
-                    shared_from_this(),
-                    std::placeholders::_1,
-                    needs_to_be_read,
-                    is_final
-                )
-            );
-        }
-        else
-        {
-            on_frame_read(error_code{}, message::frame_header::HEADER_SIZE, is_final);
-        }
-    }
-
-    void on_frame_read(const error_code& err, int n_read, bool is_final)
-    {
-        if (err) {
-            throw std::runtime_error {
-                "Error occurred."
-            };
-        }
-
-        if (is_final)
-            std::cout << "Message received" << std::endl;
-
-        auto buffer = m_read_buffer.data();
-
-        copy(
-            buffers_begin(buffer),
-            buffers_end(buffer),
-            back_inserter(received_message)
-        );
-        m_read_buffer.consume(n_read);
-
-        boost::asio::async_read(
-            m_sck,
-            m_read_buffer,
-            boost::asio::transfer_exactly(message::frame_header::HEADER_SIZE),
-            bind(
-                &connection::on_frame_header_read,
-                shared_from_this() ,
-                std::placeholders::_1
-            )
-        );
-    }
-
-    std::vector<std::uint8_t> received_message;
-    std::atomic<int> m_correlation_id;
-    std::unordered_map<int, std::function<void()>> m_handlers;
-    streambuf m_write_buffer;
-    streambuf m_read_buffer;
-    socket    m_sck;
+    byte_array_t m_received_message;
+    bool         m_write_in_progress;
+    uint64_t     m_correlation_id;
+    handlers_t   m_handlers;
+    int          m_active_buffer_idx;
+    streambuf    m_write_buffers[2];
+    streambuf    m_read_buffer;
+    socket       m_sck;
+    strand       m_strand;
 };
 
-template<typename Connection, typename CompletionToken>
-auto async_connect(
-    Connection& conn,
-    boost::asio::ip::tcp::endpoint ep,
-    CompletionToken&& token
-)
-{
-    enum {started, connecting, start_reader, protocol_sending};
-
-    return boost::asio::async_compose<
-        CompletionToken, void(boost::system::error_code)
-    >
-    (
-        [
-            &conn,
-            state = started,
-            host = std::move(ep)
-        ]
-        (
-            auto& self,
-            const boost::system::error_code& error = {}
-        ) mutable
-        {
-            if (!error)
-            {
-                switch (state)
-                {
-                    case started:
-                    {
-                        state = connecting;
-                        conn.sck().async_connect(
-                            host ,
-                            std::move(self)
-                        );
-
-                        return;
-                    }
-                    case connecting:
-                    {
-                        state = start_reader;
-                        conn.start_reader();
-
-                        self();
-
-                        return;
-                    }
-                    case start_reader:
-                    {
-                        state = protocol_sending;
-                        boost::asio::async_write(
-                            conn.sck(),
-                            boost::asio::buffer("CP2", 3),
-                            [self = std::move(self)]
-                            (const boost::system::error_code& err, std::size_t) mutable
-                            {
-                                self(err);
-                            }
-                        );
-
-                        return;
-                    }
-                }
-            }
-
-            self.complete(error);
-        },
-        token
-    );
 }
 
-template<typename Connection, typename CompletionToken>
-auto async_authenticate(
-    const message::request<message::authentication>& req,
-    Connection& conn,
-    CompletionToken&& token
-)
-{
-    enum {starting, authenticating};
-
-    req.header.correlation_id = conn.generate_id();
-    rbs::serialize_le(req, conn.write_buffer());
-
-    return boost::asio::async_compose<
-        CompletionToken, void(boost::system::error_code)
-    >(
-        [
-            conn = &conn,
-            state = starting
-        ]
-        (
-            auto& self,
-            const boost::system::error_code& error = {}
-        ) mutable
-        {
-            if (!error)
-            {
-                switch (state)
-                {
-                    case starting:
-                    {
-                        state = authenticating;
-
-                        boost::asio::async_write(
-                            conn->sck(),
-                            conn->write_buffer(),
-                            [self = std::move(self)]
-                            (const boost::system::error_code& err, std::size_t) mutable
-                            {
-                                self(err);
-                            }
-                        );
-
-                        return;
-                    }
-                }
-            }
-
-            self.complete(error);
-        },
-        token
-    );
-}
-
-}
+#include "hz_client/impl/connection_impl.hpp"
