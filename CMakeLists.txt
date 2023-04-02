@@ -50,3 +50,5 @@ target_compile_features(
 )
 
 add_subdirectory( example )
+add_subdirectory( benchmark )
+add_subdirectory( test )

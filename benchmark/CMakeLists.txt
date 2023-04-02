@@ -1,7 +1,7 @@
-add_executable(example example.cpp)
+add_executable(map-put map-put.cpp)
 
 target_link_libraries(
-    example
+    map-put
 
     PRIVATE
 

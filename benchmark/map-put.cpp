@@ -30,7 +30,6 @@ void benchmark(std::shared_ptr<hz_client::connection> connection)
                 using namespace std::chrono;
 
                 auto elapsed = steady_clock::now() - start;
-                // std::cout << std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count() << std::endl;
 
                 benchmark(connection);
             }

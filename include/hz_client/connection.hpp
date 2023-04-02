@@ -6,14 +6,6 @@
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/io_context_strand.hpp>
 #include <boost/asio/ip/tcp.hpp>
-#include <boost/asio/read.hpp>
-#include <boost/asio/write.hpp>
-#include <boost/asio/compose.hpp>
-#include <boost/asio/buffers_iterator.hpp>
-#include <boost/uuid/uuid.hpp>
-#include <boost/uuid/random_generator.hpp>
-#include <boost/iostreams/device/array.hpp>
-#include <boost/iostreams/stream_buffer.hpp>
 
 #include <rbs/rbs.hpp>
 
@@ -24,8 +16,7 @@
 namespace hz_client
 {
 
-class connection :
-      public std::enable_shared_from_this<connection>
+class connection
 {
     using io_context = boost::asio::io_context;
     using socket     = boost::asio::ip::tcp::socket;
@@ -80,7 +71,6 @@ private:
     streambuf    m_write_buffers[2];
     streambuf    m_read_buffer;
     socket       m_sck;
-    strand       m_strand;
 };
 
 }

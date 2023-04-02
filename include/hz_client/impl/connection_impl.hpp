@@ -1,6 +1,14 @@
 #pragma once
 
 #include "hz_client/connection.hpp"
+#include <boost/asio/read.hpp>
+#include <boost/asio/write.hpp>
+#include <boost/asio/compose.hpp>
+#include <boost/asio/buffers_iterator.hpp>
+#include <boost/uuid/uuid.hpp>
+#include <boost/uuid/random_generator.hpp>
+#include <boost/iostreams/device/array.hpp>
+#include <boost/iostreams/stream_buffer.hpp>
 
 namespace hz_client
 {
@@ -8,7 +16,6 @@ namespace hz_client
 inline connection::connection(io_context& ctx)
     :   m_write_in_progress {false}
     ,   m_sck {ctx}
-    ,   m_strand {ctx}
     ,   m_active_buffer_idx {0}
     ,   m_correlation_id {1}
 {}
@@ -31,8 +38,8 @@ auto connection::invoke(
         CompletionToken, void(boost::system::error_code, std::vector<char>)
     >(
         [
+            this,
             state   = starting,
-            self    = shared_from_this(),
             message = std::move(message)
         ]
         (
@@ -49,17 +56,15 @@ auto connection::invoke(
                     {
                         state = response_awaiting;
 
-                        auto copy = move(self);
-                        message.header.correlation_id = copy->m_correlation_id++;
-                        rbs::serialize_le(message, copy->pending_buffer());
+                        message.header.correlation_id = m_correlation_id++;
+                        rbs::serialize_le(message, pending_buffer());
 
-                        copy->m_handlers.emplace(
+                        m_handlers.emplace(
                             std::make_pair(
                                 message.header.correlation_id,
                                 make_shallow_copyable(
                                     [
-                                        composable = std::move(composable),
-                                        copy
+                                        composable = std::move(composable)
                                     ]
                                     (const boost::system::error_code& err, std::vector<char> response) mutable
                                     {
@@ -69,7 +74,7 @@ auto connection::invoke(
                             )
                         );
 
-                        copy->do_write();
+                        do_write();
 
                         return;
                     }
@@ -90,7 +95,7 @@ inline void connection::start_reader()
         boost::asio::transfer_exactly(message::frame_header::HEADER_SIZE),
         bind(
             &connection::on_frame_header_read,
-            shared_from_this(),
+            this,
             std::placeholders::_1
         )
     );
@@ -107,20 +112,16 @@ inline void connection::do_write()
     boost::asio::async_write(
         m_sck,
         writing_buffer().data(),
-        m_strand.wrap(
-            [
-                self = shared_from_this()
-            ](const boost::system::error_code& ec, std::size_t n){
-                self->m_write_in_progress = false;
-                if (ec) {
-                    throw std::runtime_error {
-                        "Write error."
-                    };
-                }
-
-                self->writing_buffer().consume(n);
+        [this](const boost::system::error_code& ec, std::size_t n){
+            m_write_in_progress = false;
+            if (ec) {
+                throw std::runtime_error {
+                    "Write error."
+                };
             }
-        )
+
+            writing_buffer().consume(n);
+        }
     );
 }
 
@@ -144,7 +145,7 @@ inline void connection::on_frame_header_read(const error_code& err)
             boost::asio::transfer_exactly(needs_to_be_read),
             bind(
                 &connection::on_frame_read,
-                shared_from_this(),
+                this,
                 std::placeholders::_1,
                 header.length,
                 is_final
@@ -202,7 +203,7 @@ inline void connection::on_frame_read(const error_code& err, int n_read, bool is
         boost::asio::transfer_exactly(message::frame_header::HEADER_SIZE),
         bind(
             &connection::on_frame_header_read,
-            shared_from_this() ,
+            this,
             std::placeholders::_1
         )
     );
@@ -229,15 +230,14 @@ auto connection::async_connect(
     CompletionToken&& token
 )
 {
-    enum {started, connecting, start_reader, protocol_sending};
-    auto conn = shared_from_this();
+    enum {started, connecting, start_read, protocol_sending};
 
     return boost::asio::async_compose<
         CompletionToken, void(boost::system::error_code)
     >
     (
         [
-            conn = move(conn),
+            this,
             state = started,
             host = std::move(ep)
         ]
@@ -253,7 +253,7 @@ auto connection::async_connect(
                     case started:
                     {
                         state = connecting;
-                        conn->sck().async_connect(
+                        sck().async_connect(
                             host ,
                             std::move(composable)
                         );
@@ -262,22 +262,20 @@ auto connection::async_connect(
                     }
                     case connecting:
                     {
-                        state = start_reader;
-                        conn->start_reader();
+                        state = start_read;
+                        start_reader();
 
                         composable();
 
                         return;
                     }
-                    case start_reader:
+                    case start_read:
                     {
                         state = protocol_sending;
-                        auto& sck = conn->sck();
                         boost::asio::async_write(
-                            sck,
+                            m_sck,
                             boost::asio::buffer("CP2", 3),
                             [
-                                conn       = move(conn),
                                 composable = std::move(composable)
                             ]
                             (const boost::system::error_code& err, std::size_t) mutable
@@ -304,13 +302,12 @@ auto connection::async_authenticate(
 )
 {
     enum {starting, authenticating};
-    auto conn = shared_from_this();
 
     return boost::asio::async_compose<
         CompletionToken, void(boost::system::error_code)
     >(
         [
-            conn = move(conn),
+            this,
             req   = std::move(req),
             state = starting
         ]
@@ -331,7 +328,7 @@ auto connection::async_authenticate(
 
                         message.entity = std::move(req);
 
-                        conn->invoke(
+                        invoke(
                             std::move(message),
                             make_shallow_copyable(
                                 [composable = std::move(composable)](
