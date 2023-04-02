@@ -1,6 +1,8 @@
 cmake_minimum_required( VERSION 3.10 )
 project( hz_client )
 
+set(CMAKE_VERBOSE_MAKEFILE ON)
+
 include(FetchContent)
 
 FetchContent_Declare(
@@ -37,14 +39,6 @@ target_link_libraries(
 
         Boost::boost
         rbs::rbs
-)
-
-target_compile_definitions(
-        hz_client
-
-        INTERFACE
-        
-            BOOST_THREAD_VERSION=5
 )
 
 target_compile_features(

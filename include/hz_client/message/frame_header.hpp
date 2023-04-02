@@ -73,7 +73,12 @@ rbs::stream<Args...>& operator<<(
     const frame_header& x
 )
 {
-    return ss << x.length << x.flags;
+    auto prev = ss.byte_order();
+    ss.byte_order(rbs::endian::little);
+    ss << x.length << x.flags;
+    ss.byte_order(prev);
+
+    return ss;
 }
 
 template<auto... Args>
@@ -82,7 +87,10 @@ rbs::stream<Args...>& operator>>(
     frame_header& x
 )
 {
+    auto prev = ss.byte_order();
+    ss.byte_order(rbs::endian::little);
     ss >> x.length >> x.flags;
+    ss.byte_order(prev);
 
     return ss;
 }

@@ -49,36 +49,27 @@ auto connection::invoke(
                     {
                         state = response_awaiting;
 
-                        self->m_strand.post(
-                            make_shallow_copyable(
-                                [
-                                    self       = move(self),
-                                    message    = std::move(message),
-                                    composable = std::move(composable)
-                                ]() mutable {
-                                    message.header.correlation_id = self->m_correlation_id++;
-                                    rbs::serialize_le(message, self->pending_buffer());
+                        auto copy = move(self);
+                        message.header.correlation_id = copy->m_correlation_id++;
+                        rbs::serialize_le(message, copy->pending_buffer());
 
-                                    self->m_handlers.emplace(
-                                        std::make_pair(
-                                            message.header.correlation_id,
-                                            make_shallow_copyable(
-                                                [
-                                                    composable = std::move(composable),
-                                                    self       = self
-                                                ]
-                                                (const boost::system::error_code& err, std::vector<char> response) mutable
-                                                {
-                                                    composable(err, move(response));
-                                                }
-                                            )
-                                        )
-                                    );
-
-                                    self->do_write();
-                                }
+                        copy->m_handlers.emplace(
+                            std::make_pair(
+                                message.header.correlation_id,
+                                make_shallow_copyable(
+                                    [
+                                        composable = std::move(composable),
+                                        copy
+                                    ]
+                                    (const boost::system::error_code& err, std::vector<char> response) mutable
+                                    {
+                                        composable(err, move(response));
+                                    }
+                                )
                             )
                         );
+
+                        copy->do_write();
 
                         return;
                     }
@@ -97,12 +88,10 @@ inline void connection::start_reader()
         m_sck,
         m_read_buffer,
         boost::asio::transfer_exactly(message::frame_header::HEADER_SIZE),
-        m_strand.wrap(
-            bind(
-                &connection::on_frame_header_read,
-                shared_from_this(),
-                std::placeholders::_1
-            )
+        bind(
+            &connection::on_frame_header_read,
+            shared_from_this(),
+            std::placeholders::_1
         )
     );
 }
@@ -138,7 +127,7 @@ inline void connection::do_write()
 inline void connection::on_frame_header_read(const error_code& err)
 {
     message::frame_header header;
-    rbs::le_stream ss {m_read_buffer};
+    rbs::stream ss {m_read_buffer, rbs::endian::little};
 
     ss >> header;
     ss << header;
@@ -153,14 +142,12 @@ inline void connection::on_frame_header_read(const error_code& err)
             m_sck,
             m_read_buffer,
             boost::asio::transfer_exactly(needs_to_be_read),
-            m_strand.wrap(
-                bind(
-                    &connection::on_frame_read,
-                    shared_from_this(),
-                    std::placeholders::_1,
-                    header.length,
-                    is_final
-                )
+            bind(
+                &connection::on_frame_read,
+                shared_from_this(),
+                std::placeholders::_1,
+                header.length,
+                is_final
             )
         );
     }
@@ -194,7 +181,7 @@ inline void connection::on_frame_read(const error_code& err, int n_read, bool is
             size(m_received_message)
         };
 
-        rbs::le_stream is {rd_buffer};
+        rbs::stream is {rd_buffer, rbs::endian::little};
 
         message::initial_frame iframe;
 
@@ -213,12 +200,10 @@ inline void connection::on_frame_read(const error_code& err, int n_read, bool is
         m_sck,
         m_read_buffer,
         boost::asio::transfer_exactly(message::frame_header::HEADER_SIZE),
-        m_strand.wrap(
-            bind(
-                &connection::on_frame_header_read,
-                shared_from_this() ,
-                std::placeholders::_1
-            )
+        bind(
+            &connection::on_frame_header_read,
+            shared_from_this() ,
+            std::placeholders::_1
         )
     );
 }
@@ -252,7 +237,7 @@ auto connection::async_connect(
     >
     (
         [
-            conn,
+            conn = move(conn),
             state = started,
             host = std::move(ep)
         ]
@@ -292,7 +277,7 @@ auto connection::async_connect(
                             sck,
                             boost::asio::buffer("CP2", 3),
                             [
-                                conn       = conn,
+                                conn       = move(conn),
                                 composable = std::move(composable)
                             ]
                             (const boost::system::error_code& err, std::size_t) mutable
@@ -325,7 +310,7 @@ auto connection::async_authenticate(
         CompletionToken, void(boost::system::error_code)
     >(
         [
-            conn,
+            conn = move(conn),
             req   = std::move(req),
             state = starting
         ]
